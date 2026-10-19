@@ -15,8 +15,8 @@
  * Nothing about the plaintext (names, sizes, the root CID) is in the public header.
  */
 
-import { createReadStream, createWriteStream } from 'node:fs'
-import { mkdir, readdir, readFile, rm, stat } from 'node:fs/promises'
+import { createReadStream, createWriteStream, readdirSync, rmSync } from 'node:fs'
+import { mkdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import { isCancel, password as promptPassword } from '@clack/prompts'
@@ -118,7 +118,7 @@ async function openEnvelope(
     sniff.destroy()
   }
   if (!car) {
-    const stream = Readable.toWeb(createReadStream(inputPath, { highWaterMark: 1 << 20 })) as ReadableStream<Uint8Array>
+    const stream = Readable.toWeb(createReadStream(inputPath)) as ReadableStream<Uint8Array>
     return { stream, close: () => Promise.resolve() }
   }
   const reader = await CarIndexedReader.fromFile(inputPath)
@@ -133,17 +133,15 @@ async function openEnvelope(
   }
 }
 
-/** The blocks of a CAR, by CID. */
-export interface BlockSource {
-  get(cid: CID): Promise<{ bytes: Uint8Array } | undefined>
-}
-
 /**
  * The bytes of the UnixFS file at `cid`, one leaf per pull. Reading leaves on demand keeps
  * memory at a block or two however large the file is; a reader that runs ahead of the
  * decryptor would queue the whole ciphertext.
  */
-export async function* unixfsFileBytes(blocks: BlockSource, cid: CID): AsyncGenerator<Uint8Array> {
+export async function* unixfsFileBytes(
+  blocks: { get(cid: CID): Promise<{ bytes: Uint8Array } | undefined> },
+  cid: CID
+): AsyncGenerator<Uint8Array> {
   const block = await blocks.get(cid)
   if (block == null) {
     throw new Error(`block ${cid} is missing from the CAR`)
@@ -169,33 +167,45 @@ export async function* unixfsFileBytes(blocks: BlockSource, cid: CID): AsyncGene
   }
 }
 
+const exists = (path: string): Promise<Awaited<ReturnType<typeof stat>> | undefined> =>
+  stat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return undefined
+    throw error
+  })
+
 /**
- * Check both paths before anything is created or armed: the input must exist, and the
- * output must be absent, or an empty directory.
+ * Check both paths before anything is created or armed: the input must be a file, and the
+ * output must be absent, or an empty directory. Returns whether the output exists.
  */
-export async function checkDecryptPaths(inputPath: string, outDir: string): Promise<void> {
-  try {
-    await stat(inputPath)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new Error(`Input file not found: ${inputPath}`)
-    }
-    throw error
+export async function checkDecryptPaths(inputPath: string, outDir: string): Promise<{ outExists: boolean }> {
+  const input = await exists(inputPath)
+  if (input == null) {
+    throw new Error(`Input file not found: ${inputPath}`)
   }
-  let out: Awaited<ReturnType<typeof stat>>
-  try {
-    out = await stat(outDir)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return
-    }
-    throw error
+  if (input.isDirectory()) {
+    throw new Error(`Input path is a directory: ${inputPath}`)
+  }
+  const out = await exists(outDir)
+  if (out == null) {
+    return { outExists: false }
   }
   if (!out.isDirectory()) {
     throw new Error(`Output path exists and is not a directory: ${outDir}`)
   }
-  if ((await readdir(outDir)).length > 0) {
+  if (readdirSync(outDir).length > 0) {
     throw new Error(`Output directory is not empty: ${outDir}`)
+  }
+  return { outExists: true }
+}
+
+/** Remove what decrypt wrote: the directory when it created it, otherwise its entries. Sync so a signal handler can call it. */
+export function removeDecryptOutput(outDir: string, created: boolean): void {
+  if (created) {
+    rmSync(outDir, { recursive: true, force: true })
+    return
+  }
+  for (const entry of readdirSync(outDir)) {
+    rmSync(join(outDir, entry), { recursive: true, force: true })
   }
 }
 
@@ -205,24 +215,9 @@ export async function checkDecryptPaths(inputPath: string, outDir: string): Prom
  * failure everything written is removed; a pre-existing directory itself is kept.
  */
 export async function decryptToDirectory(inputPath: string, outDir: string, password: string): Promise<UnpackResult> {
-  await checkDecryptPaths(inputPath, outDir)
-  let created = false
-  try {
+  const { outExists } = await checkDecryptPaths(inputPath, outDir)
+  if (!outExists) {
     await mkdir(outDir, { mode: 0o700 })
-    created = true
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-      throw error
-    }
-  }
-  const cleanup = async (): Promise<void> => {
-    if (created) {
-      await rm(outDir, { recursive: true, force: true })
-      return
-    }
-    for (const entry of await readdir(outDir)) {
-      await rm(join(outDir, entry), { recursive: true, force: true })
-    }
   }
   let envelope: Awaited<ReturnType<typeof openEnvelope>> | undefined
   try {
@@ -238,7 +233,7 @@ export async function decryptToDirectory(inputPath: string, outDir: string, pass
     )
     return await unpackCar(plaintext, outDir)
   } catch (error) {
-    await cleanup()
+    removeDecryptOutput(outDir, !outExists)
     if (error instanceof fee.errors.AuthenticationError) {
       throw new Error('Wrong password, or the file was modified', { cause: error })
     }
