@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.3.0](https://github.com/filecoin-project/filecoin-pin/compare/v2.2.1...v2.3.0) (2026-10-19)
+
+
+### Features
+
+* add migrate state store and CLI parsers ([#653](https://github.com/filecoin-project/filecoin-pin/issues/653)) ([e36ddef](https://github.com/filecoin-project/filecoin-pin/commit/e36ddef6f29d6670c034f6f13b71c503424d6d10))
+
+
+### Chores
+
+* **deps:** bump fastify from 5.12.1 to 5.12.5 ([#759](https://github.com/filecoin-project/filecoin-pin/issues/759)) ([0887bec](https://github.com/filecoin-project/filecoin-pin/commit/0887bec25a0ce003d23895eb7c062b84fef452e1))
+
 ## [2.2.1](https://github.com/filecoin-project/filecoin-pin/compare/v2.2.0...v2.2.1) (2026-10-12)
 
 
