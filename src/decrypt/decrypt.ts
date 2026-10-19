@@ -6,7 +6,7 @@ import { existsSync, readdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import pc from 'picocolors'
 import { CliFatal, EXIT_CODE_INCOMPLETE, isCliIncomplete } from '../common/cli-errors.js'
-import { decryptToDirectory, resolvePassword } from '../common/encryption.js'
+import { checkDecryptPaths, decryptToDirectory, resolvePassword } from '../common/encryption.js'
 import { cancel, createSpinner, intro, outro } from '../utils/cli-helpers.js'
 
 export async function runDecrypt(
@@ -32,6 +32,8 @@ export async function runDecrypt(
   }
 
   try {
+    // Before the handler is armed: it must never remove entries decrypt would have refused to touch.
+    await checkDecryptPaths(inputPath, outputDir)
     const password = await resolvePassword(options.passwordFile)
     process.once('SIGINT', onSigint)
     spinner.start('Decrypting...')

@@ -16,18 +16,19 @@
  */
 
 import { createReadStream, createWriteStream } from 'node:fs'
-import { mkdir, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import { isCancel, password as promptPassword } from '@clack/prompts'
 import { CarIndexedReader } from '@ipld/car'
+import * as dagPb from '@ipld/dag-pb'
 import * as fee from 'filecoin-encryption-envelope'
-import { exporter } from 'ipfs-unixfs-exporter'
+import { UnixFS } from 'ipfs-unixfs'
 import { CID } from 'multiformats/cid'
 import { isCar } from '../core/car/index.js'
 import { isInteractive } from '../utils/cli-helpers.js'
 import { CliIncomplete } from './cli-errors.js'
-import { CAR_CONTENT_TYPE } from './unixfs-car-layout.js'
+import { CAR_CONTENT_TYPE, DAG_PB_CODEC, RAW_CODEC } from './unixfs-car-layout.js'
 import { type CarPayloadPlan, emitCarPayload, planCarPayload, type WalkOptions } from './unixfs-car-payload.js'
 import { type UnpackResult, unpackCar } from './unixfs-car-unpack.js'
 
@@ -126,23 +127,75 @@ async function openEnvelope(
     await reader.close()
     throw new Error(NOT_OURS)
   }
-  // The exporter's multiformats is a different major than the reader's; cross by string and bytes.
-  const entry = await exporter(root.toString(), {
-    async *get(cid) {
-      const block = await reader.get(CID.decode(cid.bytes))
-      if (block == null) {
-        throw new Error(`block ${cid} is missing from the CAR`)
-      }
-      yield block.bytes
-    },
-  })
-  if (entry.type !== 'file' && entry.type !== 'raw') {
-    await reader.close()
+  return {
+    stream: Readable.toWeb(Readable.from(unixfsFileBytes(reader, root))) as ReadableStream<Uint8Array>,
+    close: () => reader.close(),
+  }
+}
+
+/** The blocks of a CAR, by CID. */
+export interface BlockSource {
+  get(cid: CID): Promise<{ bytes: Uint8Array } | undefined>
+}
+
+/**
+ * The bytes of the UnixFS file at `cid`, one leaf per pull. Reading leaves on demand keeps
+ * memory at a block or two however large the file is; a reader that runs ahead of the
+ * decryptor would queue the whole ciphertext.
+ */
+export async function* unixfsFileBytes(blocks: BlockSource, cid: CID): AsyncGenerator<Uint8Array> {
+  const block = await blocks.get(cid)
+  if (block == null) {
+    throw new Error(`block ${cid} is missing from the CAR`)
+  }
+  if (cid.code === RAW_CODEC) {
+    yield block.bytes
+    return
+  }
+  if (cid.code !== DAG_PB_CODEC) {
     throw new Error(NOT_OURS)
   }
-  return {
-    stream: Readable.toWeb(Readable.from(entry.content())) as ReadableStream<Uint8Array>,
-    close: () => reader.close(),
+  const node = dagPb.decode(block.bytes)
+  const unixfs = node.Data == null ? undefined : UnixFS.unmarshal(node.Data)
+  if (unixfs == null || (unixfs.type !== 'file' && unixfs.type !== 'raw')) {
+    throw new Error(NOT_OURS)
+  }
+  if (unixfs.data != null && unixfs.data.length > 0) {
+    yield unixfs.data
+  }
+  for (const link of node.Links) {
+    // dag-pb's multiformats is a different major than the reader's; cross by bytes.
+    yield* unixfsFileBytes(blocks, CID.decode(link.Hash.bytes))
+  }
+}
+
+/**
+ * Check both paths before anything is created or armed: the input must exist, and the
+ * output must be absent, or an empty directory.
+ */
+export async function checkDecryptPaths(inputPath: string, outDir: string): Promise<void> {
+  try {
+    await stat(inputPath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(`Input file not found: ${inputPath}`)
+    }
+    throw error
+  }
+  let out: Awaited<ReturnType<typeof stat>>
+  try {
+    out = await stat(outDir)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return
+    }
+    throw error
+  }
+  if (!out.isDirectory()) {
+    throw new Error(`Output path exists and is not a directory: ${outDir}`)
+  }
+  if ((await readdir(outDir)).length > 0) {
+    throw new Error(`Output directory is not empty: ${outDir}`)
   }
 }
 
@@ -152,6 +205,7 @@ async function openEnvelope(
  * failure everything written is removed; a pre-existing directory itself is kept.
  */
 export async function decryptToDirectory(inputPath: string, outDir: string, password: string): Promise<UnpackResult> {
+  await checkDecryptPaths(inputPath, outDir)
   let created = false
   try {
     await mkdir(outDir, { mode: 0o700 })
@@ -159,9 +213,6 @@ export async function decryptToDirectory(inputPath: string, outDir: string, pass
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
       throw error
-    }
-    if ((await readdir(outDir)).length > 0) {
-      throw new Error(`Output directory is not empty: ${outDir}`)
     }
   }
   const cleanup = async (): Promise<void> => {

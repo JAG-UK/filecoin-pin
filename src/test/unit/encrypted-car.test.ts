@@ -47,7 +47,7 @@ describe('encrypted CAR payload', () => {
     await encryptPathWithPassword(input, envelope, PASSWORD)
     const result = await decryptToDirectory(envelope, outDir, PASSWORD)
 
-    expect(result).toEqual({ files: 1, dirs: 0, bytes: content.length })
+    expect(result).toMatchObject({ files: 1, dirs: 0, bytes: content.length })
     expect((await readFile(join(outDir, 'input'))).equals(content)).toBe(true)
     if (process.platform !== 'win32') {
       expect((await stat(outDir)).mode & 0o777).toBe(0o700)

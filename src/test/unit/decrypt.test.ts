@@ -1,13 +1,14 @@
 import { randomBytes } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, writeFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { CarIndexedReader } from '@ipld/car'
 import * as fee from 'filecoin-encryption-envelope'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CliIncomplete, EXIT_CODE_INCOMPLETE } from '../../common/cli-errors.js'
-import { encryptPathWithPassword } from '../../common/encryption.js'
+import { decryptToDirectory, encryptPathWithPassword, unixfsFileBytes } from '../../common/encryption.js'
 import { CAR_CONTENT_TYPE } from '../../common/unixfs-car-layout.js'
 import { createCarFromPath } from '../../core/unixfs/index.js'
 import { runDecrypt } from '../../decrypt/decrypt.js'
@@ -197,10 +198,13 @@ describe('runDecrypt', () => {
       throw new CliIncomplete('exit')
     })
     await mkdir(outputDir)
-    await writeFile(join(outputDir, 'partial.bin'), 'half-written plaintext')
     const { createSpinner } = await import('../../utils/cli-helpers.js')
     vi.mocked(createSpinner).mockReturnValueOnce({
-      start: vi.fn(() => process.emit('SIGINT')),
+      // Decrypt has written half a file by the time the signal lands.
+      start: vi.fn(() => {
+        writeFileSync(join(outputDir, 'partial.bin'), 'half-written plaintext')
+        process.emit('SIGINT')
+      }),
       stop: vi.fn(),
       message: vi.fn(),
       clear: vi.fn(),
@@ -212,6 +216,78 @@ describe('runDecrypt', () => {
     expect(existsSync(join(outputDir, 'partial.bin'))).toBe(false)
     expect(existsSync(outputDir)).toBe(true)
     expect(process.listenerCount('SIGINT')).toBe(0)
+  })
+
+  it('refuses a non-empty output directory before arming the Ctrl-C handler', async () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new CliIncomplete('exit')
+    })
+    await mkdir(outputDir)
+    await writeFile(join(outputDir, 'keep.txt'), 'keep me')
+    const { createSpinner } = await import('../../utils/cli-helpers.js')
+    vi.mocked(createSpinner).mockReturnValueOnce({
+      start: vi.fn(() => process.emit('SIGINT')),
+      stop: vi.fn(),
+      message: vi.fn(),
+      clear: vi.fn(),
+    } as never)
+
+    await expect(runDecrypt(encryptedPath, outputDir, {})).rejects.toThrow(/not empty/)
+
+    expect(exit).not.toHaveBeenCalled()
+    expect(await readFile(join(outputDir, 'keep.txt'), 'utf8')).toBe('keep me')
+    expect(process.listenerCount('SIGINT')).toBe(0)
+  })
+
+  it('reports an output path that is a file', async () => {
+    await writeFile(outputDir, 'a file')
+
+    await expect(runDecrypt(encryptedPath, outputDir, {})).rejects.toThrow(/exists and is not a directory/)
+    expect(await readFile(outputDir, 'utf8')).toBe('a file')
+  })
+
+  it('reports a missing input before creating the output directory', async () => {
+    await expect(runDecrypt(join(dir, 'missing.fee'), outputDir, {})).rejects.toThrow(/Input file not found/)
+    expect(existsSync(outputDir)).toBe(false)
+  })
+
+  it('decrypts the checked-in multi-chunk golden envelope and pins its inner root', async () => {
+    const golden = fileURLToPath(new URL('../fixtures/encrypted-golden/big.fee', import.meta.url))
+    const size = 1_100_000
+    const expected = new Uint8Array(size)
+    for (let i = 0; i < size; i++) expected[i] = (i * 7919 + (i >> 8)) & 0xff
+
+    const result = await decryptToDirectory(golden, outputDir, 'golden password 2026-10-19')
+
+    expect(result).toEqual({
+      files: 1,
+      dirs: 0,
+      bytes: size,
+      root: 'bafybeifi5o5cikl37er2zmvmbwgcsoh5df7q2q4soo6iwvlit7nstujohm',
+    })
+    expect((await readFile(join(outputDir, 'big.bin'))).equals(expected)).toBe(true)
+  })
+
+  it('reads the outer CAR one leaf at a time instead of ahead of the consumer', async () => {
+    const { carPath } = await createCarFromPath(encryptedPath, {})
+    const reader = await CarIndexedReader.fromFile(carPath)
+    let reads = 0
+    const counting = {
+      get: async (cid: Parameters<typeof reader.get>[0]) => {
+        reads++
+        return reader.get(cid)
+      },
+    }
+    const [root] = await reader.getRoots()
+    if (root == null) throw new Error('no root')
+
+    const leaves = unixfsFileBytes(counting, root)
+    await leaves.next()
+
+    // The root node plus the first leaf; nothing fetched ahead of what was pulled.
+    expect(reads).toBeLessThanOrEqual(2)
+    await leaves.return(undefined)
+    await reader.close()
   })
 
   it('rejects a file that is not an envelope', async () => {
