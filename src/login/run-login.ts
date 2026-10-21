@@ -14,6 +14,7 @@
  * key), 1 on an error.
  */
 
+import * as Keysmith from '@filoz/keysmith'
 import {
   AddPiecesPermission,
   CreateDataSetPermission,
@@ -22,23 +23,29 @@ import {
 } from '@filoz/synapse-core/session-key'
 import type { FilecoinChain } from '@filoz/synapse-sdk'
 import pc from 'picocolors'
-import { type Address, createPublicClient } from 'viem'
+import { type Address, createClient, createPublicClient, type Hex } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
 import { getBlockNumber } from 'viem/actions'
 import { EXIT_CODE_INCOMPLETE } from '../common/cli-errors.js'
 import {
   buildAuthorizeUrl,
   buildFundingUrl,
+  buildSetupUrl,
   consoleNetworkSlug,
   DEFAULT_SUGGESTED_DEPOSIT_USDFC,
+  keyAgreementMessage,
   resolveConsoleUrl,
 } from '../core/session/console-url.js'
 import { generateSessionKeypair } from '../core/session/create-session-key.js'
 import {
   DEFAULT_WATCH_DEADLINE_MS,
+  readScopeGrants,
   type WatchAuthorizationResult,
   watchAuthorization,
 } from '../core/session/watch-authorization.js'
 import { initializeSynapse } from '../core/synapse/index.js'
+import { type GrantInbox, grantPort, grantReturnMode, openGrantInbox } from '../keyspace/grant-return.js'
+import { acceptKeyspaceGrant, openSavedKeyspace, parseRole } from '../keyspace/keyspace.js'
 import { resolveNetwork } from '../session/resolve-network.js'
 import { parseScopes, SCOPE_IDS, SCOPE_PERMISSIONS } from '../session/scopes.js'
 import { createSpinner } from '../utils/cli-helpers.js'
@@ -169,6 +176,13 @@ export async function runLogin(options: LoginOptions): Promise<number> {
     )
   }
   const consoleUrl = resolveConsoleUrl()
+  const requestedKeyspace = parseKeyspaceOption(options.keyspace)
+  const role = options.role === undefined ? undefined : parseRole(options.role)
+  if (role !== undefined && requestedKeyspace === undefined) {
+    throw new Error('--role shares one role of a keyspace: add --keyspace <id|new>.')
+  }
+  // Checked before a key is saved, so a misspelt setting leaves nothing behind.
+  const grantReturn = requestedKeyspace === undefined ? undefined : { mode: grantReturnMode(), port: grantPort() }
 
   const path = getSessionFilePath()
   const { session, resumed, replaced } = loadOrCreateSession(options.fresh, network, path)
@@ -187,12 +201,60 @@ export async function runLogin(options: LoginOptions): Promise<number> {
       )
     }
   }
+  // Already holding what was asked for: nothing for the owner to sign, so the console is not opened.
+  if (resumed && requestedKeyspace !== undefined) {
+    const reuse = await savedKeyspaceCovers(session, requestedKeyspace, role, async (owner) => {
+      const scopes = await readScopeGrants({
+        client: createPublicClient({ chain, transport }),
+        sessionAddress: session.sessionAddress,
+        registryAddress,
+        permissions,
+        owner,
+      })
+      return scopes.status === 'granted'
+    })
+    if (reuse.ok) {
+      log.line(
+        `${pc.green('✓')} Already authorized, and keyspace ${reuse.keyspace}${role ? `, role ${role},` : ''} is shared with this key until ${formatExpiryDate(BigInt(reuse.expires))}. Nothing to sign.`
+      )
+      log.line('  Use --fresh for a new session key and a new keyspace grant.')
+      log.flush()
+      return 0
+    }
+    if (reuse.reason) log.line(`  The saved keyspace grant can't be reused: ${reuse.reason}. Asking the console again.`)
+  }
+
   const scopeNote = options.scopes === undefined ? ' (defaults — override with --scopes)' : ''
   log.line(`  Requesting scopes: ${scopeList(permissions)}${scopeNote}`)
   log.line('')
 
   const scopeIds = permissions.map(scopeIdOf)
-  const url = buildAuthorizeUrl(consoleUrl, session.sessionAddress, scopeIds, chain.id)
+  // Opened before the link is printed, so a keyspace grant the console sends early is kept.
+  let inbox: GrantInbox | undefined
+  if (grantReturn !== undefined) {
+    inbox = await openGrantInbox({
+      mode: grantReturn.mode,
+      consoleOrigin: new URL(consoleUrl).origin,
+      port: grantReturn.port,
+      interactive: isTTY() && process.stdin.isTTY === true,
+    })
+    log.line(
+      `  Requesting keyspace: ${requestedKeyspace}${role ? `, role ${role}` : ''}${inbox.callback ? ` (the console sends it back to ${inbox.callback.replace(/\/[0-9a-f]+$/, '/…')})` : ' (you paste the code the console shows)'}`
+    )
+  }
+  const agreementKey = requestedKeyspace === undefined ? undefined : Keysmith.publicKeyOf(session.sessionKey)
+  const url =
+    requestedKeyspace === undefined || agreementKey === undefined
+      ? buildAuthorizeUrl(consoleUrl, session.sessionAddress, scopeIds, chain.id)
+      : buildSetupUrl(consoleUrl, session.sessionAddress, scopeIds, chain.id, {
+          publicKey: agreementKey,
+          signature: await privateKeyToAccount(session.sessionKey).signMessage({
+            message: keyAgreementMessage(agreementKey),
+          }),
+          keyspace: requestedKeyspace,
+          role,
+          callback: inbox?.callback,
+        })
   log.line('  Approve this key with your wallet in the Filecoin Cloud console:')
   // The link on its own line, unstyled, so it copies and parses cleanly.
   log.line(url)
@@ -218,6 +280,10 @@ export async function runLogin(options: LoginOptions): Promise<number> {
     log.line(
       `${pc.yellow('⚠')} Not waiting for the grant. Approve the key, then rerun \`filecoin-pin login\` to check it.`
     )
+    if (inbox) {
+      inbox.close()
+      log.line('  Save the keyspace grant code the console shows with `filecoin-pin keyspace import <code>`.')
+    }
     log.flush()
     return EXIT_CODE_INCOMPLETE
   }
@@ -266,6 +332,7 @@ export async function runLogin(options: LoginOptions): Promise<number> {
   }
 
   if (result.status === 'timeout' || result.owner === undefined) {
+    inbox?.close()
     spinner.stop(
       `${pc.yellow('⚠')} No authorization seen in time. Your key is saved; rerun \`filecoin-pin login\` to resume.`
     )
@@ -282,6 +349,18 @@ export async function runLogin(options: LoginOptions): Promise<number> {
     reportPartialGrant(permissions, result)
   }
 
+  let keyspaceShared = true
+  if (inbox && requestedKeyspace !== undefined) {
+    keyspaceShared = await receiveKeyspace(inbox, {
+      session: { ...session, fromBlock, walletAddress: result.owner },
+      requested: requestedKeyspace,
+      role,
+      client: createClient({ chain, transport }),
+      deadline: Date.now() + deadlineMs,
+      path,
+    })
+  }
+
   // Funding never blocks login: a failed readiness read is reported, not fatal.
   try {
     await reportReadiness(result.owner, chain, rpcUrl, consoleUrl)
@@ -290,5 +369,103 @@ export async function runLogin(options: LoginOptions): Promise<number> {
     log.line(`${pc.yellow('⚠')} Could not read account readiness: ${reason}. Run \`filecoin-pin balance\` to check.`)
   }
   log.flush()
-  return grantedEveryRequested(permissions, result.granted) ? 0 : EXIT_CODE_INCOMPLETE
+  return grantedEveryRequested(permissions, result.granted) && keyspaceShared ? 0 : EXIT_CODE_INCOMPLETE
+}
+
+/** `--keyspace`: `new`, or a 16-byte keyspace id. */
+/**
+ * Whether the keyspace grant saved with this login already covers the keyspace
+ * and role asked for, and the session key still holds every requested scope.
+ * Decided from session.env and the chain alone: the console is never asked.
+ * `reason` is set only when a saved grant exists but does not fit.
+ */
+async function savedKeyspaceCovers(
+  session: SavedSession,
+  requested: Hex | 'new',
+  role: string | undefined,
+  scopesLive: (owner: Address) => Promise<boolean>
+): Promise<{ ok: true; keyspace: Hex; expires: number } | { ok: false; reason?: string }> {
+  if (session.keyspaceGrant === undefined || session.walletAddress === undefined) return { ok: false }
+  if (requested === 'new') return { ok: false, reason: '--keyspace new asks for another keyspace' }
+  let open: Awaited<ReturnType<typeof openSavedKeyspace>>
+  try {
+    open = await openSavedKeyspace(session)
+  } catch (error) {
+    const cause = error instanceof Error && error.cause instanceof Error ? error.cause : error
+    return { ok: false, reason: cause instanceof Error ? cause.message : String(cause) }
+  }
+  if (open.chain.owner.toLowerCase() !== session.walletAddress.toLowerCase()) {
+    return { ok: false, reason: `it is from ${open.chain.owner}, not ${session.walletAddress}` }
+  }
+  if (open.keyspace !== requested) return { ok: false, reason: `it is for keyspace ${open.keyspace}` }
+  if (open.role !== role)
+    return { ok: false, reason: `it is for ${open.role ? `role ${open.role}` : 'the whole keyspace'}` }
+  if (!(await scopesLive(session.walletAddress))) {
+    return { ok: false, reason: 'the session key no longer holds every requested scope' }
+  }
+  return { ok: true, keyspace: open.keyspace, expires: open.expires }
+}
+
+function parseKeyspaceOption(value: string | undefined): Hex | 'new' | undefined {
+  if (value === undefined) return undefined
+  const keyspace = value.trim().toLowerCase()
+  if (keyspace === 'new' || /^0x[0-9a-f]{32}$/.test(keyspace)) return keyspace as Hex | 'new'
+  throw new Error(`--keyspace takes a keyspace id (0x and 32 hex digits) or new, not "${value}".`)
+}
+
+/**
+ * Wait for the keyspace grant from the console, check it against this login
+ * and the chain, and save it with the session key. Returns whether it was saved.
+ */
+async function receiveKeyspace(
+  inbox: GrantInbox,
+  options: {
+    session: SavedSession & { walletAddress: Address }
+    requested: Hex | 'new'
+    role: string | undefined
+    client: Parameters<typeof acceptKeyspaceGrant>[0]['client']
+    deadline: number
+    path: string
+  }
+): Promise<boolean> {
+  const { session, requested, role, client, deadline, path } = options
+  log.line(
+    `  Now share the keyspace in the console (step "Share an encryption keyspace").${inbox.callback ? ' It comes back here by itself.' : ''}`
+  )
+  log.flush()
+  try {
+    const code = await Promise.race([
+      inbox.receive('  Paste the keyspace grant code from the console (or wait for it to arrive): '),
+      // Does not hold the process open, unlike a timer left running.
+      new Promise<undefined>((resolve) => {
+        AbortSignal.timeout(Math.max(0, deadline - Date.now())).addEventListener('abort', () => resolve(undefined))
+      }),
+    ])
+    if (code === undefined) {
+      log.line(
+        `${pc.yellow('⚠')} No keyspace grant arrived in time. Save the code the console shows with \`filecoin-pin keyspace import <code>\`.`
+      )
+      return false
+    }
+    const opened = await acceptKeyspaceGrant({
+      code,
+      sessionKey: session.sessionKey,
+      owner: session.walletAddress,
+      requested,
+      role,
+      client,
+    })
+    writeSessionFile({ ...session, keyspace: opened.keyspace, keyspaceGrant: code.trim() }, path)
+    log.line(
+      `${pc.green('✓')} Keyspace ${opened.keyspace}${opened.role ? `, role ${opened.role},` : ''} shared until ${formatExpiryDate(BigInt(opened.expires))}: its key matches what your wallet signed${opened.checkedOnChain ? ', and the keyspace matches its on-chain commitment' : ' (a new keyspace: the first upload records its commitment)'}`
+    )
+    log.line(`  Saved with the session key. Try: filecoin-pin keyspace put <file>`)
+    return true
+  } catch (error) {
+    log.line(`${pc.red('✗')} ${error instanceof Error ? error.message : String(error)}`)
+    return false
+  } finally {
+    inbox.close()
+    log.flush()
+  }
 }

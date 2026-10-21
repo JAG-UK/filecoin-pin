@@ -37,9 +37,24 @@ const CONSOLE_NETWORK_SLUG: Record<number, string> = {
   314159: 'calibration',
 }
 
+/**
+ * A console run on this machine (`CONSOLE_URL` on localhost) can be started
+ * against foc-devnet and then knows the devnet; a deployed console does not,
+ * and refuses a link that names it.
+ */
+function networkSlugs(): Record<number, string> {
+  let local = false
+  try {
+    local = ['localhost', '127.0.0.1'].includes(new URL(process.env.CONSOLE_URL ?? '').hostname)
+  } catch {
+    // No console URL, or not one: the deployed console.
+  }
+  return local ? { ...CONSOLE_NETWORK_SLUG, 31415926: 'devnet' } : CONSOLE_NETWORK_SLUG
+}
+
 /** The console's name for a chain, or undefined when the console has no page for it (devnet, custom RPC). */
 export function consoleNetworkSlug(chainId: number): string | undefined {
-  return CONSOLE_NETWORK_SLUG[chainId]
+  return networkSlugs()[chainId]
 }
 
 /**
@@ -67,8 +82,46 @@ export function buildAuthorizeUrl(
   )
 }
 
-/** Console network slugs, for placing a link the session file recorded by name. */
-const CONSOLE_NETWORKS = new Set(Object.values(CONSOLE_NETWORK_SLUG))
+/** What `/console/setup` needs to share a Keysmith keyspace with the session key. */
+export interface KeyspaceLinkRequest {
+  /**
+   * The session key's Keysmith key-agreement public key (`publicKeyOf`), which
+   * the keyspace grant is wrapped to. Keysmith derives it from the session key
+   * but keeps it separate from the signing key.
+   */
+  publicKey: string
+  /** The session key's signature over {@link keyAgreementMessage}, which binds the two. */
+  signature: string
+  /** Keyspace id, or `new` for the console to start one. */
+  keyspace: string
+  /** A role (Keysmith scope path) to share instead of the whole keyspace. */
+  role?: string | undefined
+  /** Loopback URL this process listens on for the keyspace grant; omitted when it only takes a paste. */
+  callback?: string | undefined
+}
+
+/** What the session key signs so the console can tell the key-agreement key is the session key holder's. */
+export const keyAgreementMessage = (publicKey: string) => `Keysmith key agreement key: ${publicKey.toLowerCase()}`
+
+/**
+ * The `/console/setup` link for a session key plus a keyspace grant: the
+ * console authorizes the key, then shares the keyspace with it.
+ */
+export function buildSetupUrl(
+  consoleUrl: string,
+  sessionAddress: string,
+  scopeIds: string[],
+  chainId: number,
+  keyspace: KeyspaceLinkRequest
+): string {
+  const base = trimSlash(consoleUrl)
+  const callback = keyspace.callback ? `&callback=${encodeURIComponent(keyspace.callback)}` : ''
+  const role = keyspace.role ? `&role=${encodeURIComponent(keyspace.role)}` : ''
+  return withUtm(
+    `${base}/console/setup?authorize=${sessionAddress.toLowerCase()}&scopes=${scopeIds.join(',')}${networkParam(chainId)}&pubkey=${keyspace.publicKey.toLowerCase()}&pubkeysig=${keyspace.signature}&keyspace=${keyspace.keyspace}${role}${callback}`,
+    'login'
+  )
+}
 
 /**
  * Revoke deep link: the console opens its revoke dialog on this key, so the
@@ -81,14 +134,14 @@ const CONSOLE_NETWORKS = new Set(Object.values(CONSOLE_NETWORK_SLUG))
  */
 export function buildRevokeUrl(consoleUrl: string, sessionAddress: string, network: string | undefined): string {
   const page = `${trimSlash(consoleUrl)}/console/session-keys`
-  if (network === undefined || !CONSOLE_NETWORKS.has(network)) return withUtm(page, 'revoke')
+  if (network === undefined || !Object.values(networkSlugs()).includes(network)) return withUtm(page, 'revoke')
   // Lowercased for the same reason as buildAuthorizeUrl: strict isAddress.
   return withUtm(`${page}?revoke=${sessionAddress.toLowerCase()}&network=${network}`, 'revoke')
 }
 
 /** `&network=<slug>` for a chain the console knows, empty otherwise: the console refuses a link it cannot place. */
 function networkParam(chainId: number): string {
-  const network = CONSOLE_NETWORK_SLUG[chainId]
+  const network = networkSlugs()[chainId]
   return network ? `&network=${network}` : ''
 }
 

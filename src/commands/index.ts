@@ -3,6 +3,7 @@ import { balanceCommand, dashboardCommand } from './account.js'
 import { addCommand } from './add.js'
 import { dataSetCommand } from './data-set.js'
 import { importCommand } from './import.js'
+import { keyspaceCommand } from './keyspace.js'
 import { loginCommand, logoutCommand } from './login.js'
 import { paymentsCommand } from './payments.js'
 import { providerCommand } from './provider.js'
@@ -16,6 +17,7 @@ export {
   dashboardCommand,
   dataSetCommand,
   importCommand,
+  keyspaceCommand,
   loginCommand,
   logoutCommand,
   paymentsCommand,
@@ -33,7 +35,7 @@ interface CliCommandGroup {
 /** Every top-level CLI command, grouped and ordered for help output. */
 export const CLI_COMMAND_GROUPS: readonly CliCommandGroup[] = [
   { heading: 'ACCOUNT', commands: [loginCommand, logoutCommand, balanceCommand, dashboardCommand] },
-  { heading: 'UPLOAD', commands: [addCommand, importCommand] },
+  { heading: 'UPLOAD', commands: [addCommand, importCommand, keyspaceCommand] },
   { heading: 'PAYMENTS', commands: [paymentsCommand] },
   { heading: 'MANAGEMENT', commands: [dataSetCommand, providerCommand, removeCommand] },
   { heading: 'ADVANCED', commands: [sessionCommand, serverCommand] },

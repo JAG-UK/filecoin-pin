@@ -35,6 +35,10 @@ export interface SavedSession {
    * names the owner.
    */
   fromBlock?: bigint
+  /** Keysmith keyspace this key may encrypt and decrypt in, once the owner has shared it. */
+  keyspace?: Hex
+  /** The keyspace grant: the keyspace key wrapped to this session key, as base64url CBOR. */
+  keyspaceGrant?: string
 }
 
 /** Absolute path of the session file. */
@@ -74,6 +78,12 @@ export function readSessionFile(path: string = getSessionFilePath()): SavedSessi
   if (network !== undefined && /^[a-z]+$/.test(network)) session.network = network
   const fromBlock = parsed.FROM_BLOCK
   if (fromBlock !== undefined && /^\d+$/.test(fromBlock)) session.fromBlock = BigInt(fromBlock)
+  const keyspace = parsed.KEYSPACE
+  const keyspaceGrant = parsed.KEYSPACE_GRANT
+  if (isHex(keyspace, 16) && keyspaceGrant !== undefined && /^[A-Za-z0-9_-]+$/.test(keyspaceGrant)) {
+    session.keyspace = keyspace
+    session.keyspaceGrant = keyspaceGrant
+  }
   return session
 }
 
@@ -92,6 +102,9 @@ export function writeSessionFile(session: SavedSession, path: string = getSessio
   if (session.walletAddress !== undefined) lines.push(`WALLET_ADDRESS=${session.walletAddress}`)
   if (session.network !== undefined) lines.push(`NETWORK=${session.network}`)
   if (session.fromBlock !== undefined) lines.push(`FROM_BLOCK=${session.fromBlock}`)
+  if (session.keyspace !== undefined && session.keyspaceGrant !== undefined) {
+    lines.push(`KEYSPACE=${session.keyspace}`, `KEYSPACE_GRANT=${session.keyspaceGrant}`)
+  }
   mkdirSync(dirname(path), { recursive: true })
   const tmp = `${path}.${process.pid}.tmp`
   try {

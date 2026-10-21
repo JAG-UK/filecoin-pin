@@ -13,4 +13,8 @@ export interface LoginOptions {
   wait?: boolean | undefined
   /** Seconds to wait for the grant; defaults to five minutes. */
   timeout?: number | undefined
+  /** Keysmith keyspace id, or `new`, for the console to share with the session key. */
+  keyspace?: string | undefined
+  /** A role (Keysmith scope path) to share instead of the whole keyspace. */
+  role?: string | undefined
 }

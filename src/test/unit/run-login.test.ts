@@ -1,12 +1,17 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import * as Keysmith from '@filoz/keysmith'
 import { AddPiecesPermission, CreateDataSetPermission } from '@filoz/synapse-core/session-key'
-import { privateKeyToAccount } from 'viem/accounts'
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { getBlockNumber } from 'viem/actions'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { loginCommand } from '../../commands/login.js'
-import { type WatchAuthorizationResult, watchAuthorization } from '../../core/session/watch-authorization.js'
+import {
+  readScopeGrants,
+  type WatchAuthorizationResult,
+  watchAuthorization,
+} from '../../core/session/watch-authorization.js'
 import { initializeSynapse } from '../../core/synapse/index.js'
 import { openBrowser } from '../../login/open-browser.js'
 import { checkAccountReadiness } from '../../login/readiness.js'
@@ -36,6 +41,7 @@ let dataDir: string
 vi.mock('../../config.js', () => ({ getDataDirectory: () => dataDir }))
 vi.mock('../../core/session/watch-authorization.js', () => ({
   watchAuthorization: vi.fn(),
+  readScopeGrants: vi.fn(),
   DEFAULT_WATCH_DEADLINE_MS: 300000,
 }))
 vi.mock('../../login/open-browser.js', () => ({ openBrowser: vi.fn(() => false) }))
@@ -103,6 +109,7 @@ describe('runLogin', () => {
       getBlockNumber,
       checkAccountReadiness,
       watchAuthorization,
+      readScopeGrants,
     ]) {
       vi.mocked(fn).mockReset()
     }
@@ -368,6 +375,44 @@ describe('runLogin', () => {
     await expect(runLogin({ network: 'calibration', browser: false })).rejects.toThrow('3 polls in a row')
     expect(message).toHaveBeenCalledWith(expect.stringContaining('Could not watch for the authorization'))
     expect(process.listenerCount('SIGINT')).toBe(sigintListeners)
+  })
+
+  it('--keyspace reuses a saved keyspace grant that still fits, without opening the console', async () => {
+    const owner = privateKeyToAccount(generatePrivateKey())
+    const keyspace = Keysmith.newKeyspace()
+    const { kk } = await Keysmith.keyspaceKeys(owner, { owner: owner.address, keyspace })
+    const { chain, nodeKey } = await Keysmith.rootClaim(owner, {
+      owner: owner.address,
+      keyspace,
+      chainId: 314159n,
+      kk,
+      node: 'scope:team',
+      bearer: privateKeyToAccount(KEY).address,
+      maxDepth: 0,
+      expires: Math.floor(Date.now() / 1000) + 7 * 86400,
+    })
+    const grant = await Keysmith.wrapTo(
+      Keysmith.publicKeyOf(KEY),
+      nodeKey,
+      Keysmith.grantDescriptor({ owner: owner.address, keyspace }, 'scope:team')
+    )
+    writeSessionFile(
+      {
+        sessionKey: KEY,
+        sessionAddress: privateKeyToAccount(KEY).address,
+        walletAddress: owner.address,
+        network: 'calibration',
+        keyspace,
+        keyspaceGrant: Buffer.from(Keysmith.encodeDelivery(chain, grant)).toString('base64url'),
+      },
+      sessionPath()
+    )
+    vi.mocked(readScopeGrants).mockResolvedValue({ ...FULL_GRANT, status: 'granted', owner: owner.address })
+
+    expect(await runLogin({ keyspace, role: 'team' })).toBe(0)
+    expect(openBrowser).not.toHaveBeenCalled()
+    expect(watchAuthorization).not.toHaveBeenCalled()
+    expect(output()).toContain('Nothing to sign')
   })
 
   it('warns when a shell credential will shadow the saved login', async () => {
