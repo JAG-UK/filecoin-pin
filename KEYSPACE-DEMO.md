@@ -12,7 +12,8 @@ the wallet.
 | This branch | `JAG-UK/filecoin-pin`, `demo/keyspace-grants` | The CLI: `login --keyspace`, `keyspace put/get/ls/import/header` |
 | The console | `JAG-UK/filecoin-pay-explorer`, `demo/keyspace-grants` | Builds on FilOzone/filecoin-pay-explorer#577 (`/console/setup`), plus a devnet patch and the keyspace step |
 | A devnet | `FilOzone/foc-devnet` | Lotus, two Curio providers and the FOC contracts, locally |
-| Wallet funding and the inspector | `JAG-UK/keysmith-demos` | `pnpm fund` tops up a browser wallet; `pnpm app` has a byte-level inspector for pieces and grants |
+| Wallet funding and the inspector | `JAG-UK/keysmith-demos` | `pnpm fund` tops up a browser wallet; `pnpm app` has a byte-level inspector for pieces and grants (needs Keysmith's source, below) |
+| Keysmith source, for the inspector only | `JAG-UK/synapse-sdk`, `feat/keysmith` | `pnpm app` loads Keysmith from `KEYSMITH_DIR`, by default `../../synapse-sdk/packages/keysmith` from the keysmith-demos directory |
 | Keysmith and FEE | vendored as tarballs in `vendor/` (both repos) | Keysmith built from `JAG-UK/synapse-sdk@9ec535b` (`feat/keysmith`); FEE is `filecoin-encryption-envelope` 0.1.0 |
 
 Tools: Node 24, pnpm through corepack (`corepack enable`), Rust and Docker for foc-devnet, and a
@@ -97,8 +98,13 @@ first returns 404: the upload may be on either, and Curio batches piece adds for
   on macOS). `KEYSPACE` and `KEYSPACE_GRANT` (the claim chain and wrapped key, base64url) sit beside the
   session key. **The file holds the session private key: don't share or screen-share it.** To show the
   grant only: `grep '^KEYSPACE' "<that path>/session.env"`.
-- The keysmith-demos inspector (`pnpm app`, then the Inspector section) accepts a pasted
-  `KEYSPACE_GRANT=…` line, and pieces fetched by CID.
+- The keysmith-demos inspector accepts a pasted `KEYSPACE_GRANT=…` line, and pieces fetched by CID.
+  It needs a synapse-sdk checkout with its dependencies installed:
+
+  ```bash
+  git clone -b feat/keysmith https://github.com/JAG-UK/synapse-sdk.git && (cd synapse-sdk && pnpm install)
+  cd keysmith-demos && KEYSMITH_DIR=../synapse-sdk/packages/keysmith pnpm app   # then the Inspector section
+  ```
 
 ## Known rough edges
 
